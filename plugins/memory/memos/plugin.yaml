@@ -1,5 +1,5 @@
 name: memos
 version: 1.0.0
-description: "MemOS Cloud memory plugin — Server-side LLM fact extraction and semantic search via MemOS API."
+description: "MemOS — server-side LLM fact extraction with semantic search via the MemOS Cloud API."
 pip_dependencies:
   - requests

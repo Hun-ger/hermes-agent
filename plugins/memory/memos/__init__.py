@@ -1,7 +1,9 @@
-"""MemOS Cloud memory plugin — Server-side LLM fact extraction and semantic search via MemOS API.
+"""MemOS memory plugin — MemoryProvider interface.
+
+Server-side LLM fact extraction and semantic search via the MemOS Cloud API.
 
 Config via environment variables:
-  MEMOS_API_KEY      — MemOS API key (required)
+  MEMOS_API_KEY      — MemOS Platform API key (required)
   MEMOS_BASE_URL     — MemOS API base URL (default: https://memos.memtensor.cn/api/openmem/v1)
   MEMOS_USER_ID      — User identifier (default: openclaw-user)
   MEMOS_AGENT_ID     — Agent identifier (default: hermes)
@@ -25,10 +27,18 @@ from tools.registry import tool_error
 
 logger = logging.getLogger(__name__)
 
+# Circuit breaker: after this many consecutive failures, pause API calls
+# for _BREAKER_COOLDOWN_SECS to avoid hammering a down server.
 _BREAKER_THRESHOLD = 5
 _BREAKER_COOLDOWN_SECS = 120
 
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
 def _load_config() -> dict:
+    """Load config from env vars, with $HERMES_HOME/memos.json overrides."""
     from hermes_constants import get_hermes_home
 
     config = {
@@ -49,6 +59,11 @@ def _load_config() -> dict:
 
     return config
 
+
+# ---------------------------------------------------------------------------
+# Tool schemas
+# ---------------------------------------------------------------------------
+
 SEARCH_SCHEMA = {
     "name": "memos_search",
     "description": "Search memories by meaning via MemOS Cloud.",
@@ -61,6 +76,11 @@ SEARCH_SCHEMA = {
         "required": ["query"],
     },
 }
+
+
+# ---------------------------------------------------------------------------
+# MemoryProvider implementation
+# ---------------------------------------------------------------------------
 
 class MemosMemoryProvider(MemoryProvider):
     """MemOS Cloud memory provider."""
@@ -78,6 +98,7 @@ class MemosMemoryProvider(MemoryProvider):
         self._prefetch_thread = None
         self._sync_thread = None
         
+        # Circuit breaker state
         self._consecutive_failures = 0
         self._breaker_open_until = 0.0
 
@@ -89,9 +110,23 @@ class MemosMemoryProvider(MemoryProvider):
         cfg = _load_config()
         return bool(cfg.get("api_key"))
 
+    def save_config(self, values, hermes_home):
+        """Write config to $HERMES_HOME/memos.json."""
+        import json
+        from pathlib import Path
+        config_path = Path(hermes_home) / "memos.json"
+        existing = {}
+        if config_path.exists():
+            try:
+                existing = json.loads(config_path.read_text())
+            except Exception:
+                pass
+        existing.update(values)
+        config_path.write_text(json.dumps(existing, indent=2))
+
     def get_config_schema(self) -> List[Dict[str, Any]]:
         return [
-            {"key": "api_key", "description": "MemOS API key", "secret": True, "required": True, "env_var": "MEMOS_API_KEY"},
+            {"key": "api_key", "description": "MemOS Platform API key", "secret": True, "required": True, "env_var": "MEMOS_API_KEY"},
             {"key": "base_url", "description": "MemOS API Base URL", "default": "https://memos.memtensor.cn/api/openmem/v1", "env_var": "MEMOS_BASE_URL"},
             {"key": "user_id", "description": "User identifier", "default": "openclaw-user", "env_var": "MEMOS_USER_ID"},
             {"key": "agent_id", "description": "Agent identifier", "default": "hermes", "env_var": "MEMOS_AGENT_ID"},
