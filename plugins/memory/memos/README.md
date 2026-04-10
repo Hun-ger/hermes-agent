@@ -33,4 +33,6 @@ Config file: `$HERMES_HOME/memos.json`
 
 | Tool | Description |
 |------|-------------|
+| `memos_profile` | All stored memories about the user (facts, preferences, tool memories) |
 | `memos_search` | Semantic search over memories |
+| `memos_conclude` | Store a durable fact or preference manually |

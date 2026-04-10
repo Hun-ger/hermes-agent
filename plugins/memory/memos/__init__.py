@@ -64,6 +64,15 @@ def _load_config() -> dict:
 # Tool schemas
 # ---------------------------------------------------------------------------
 
+PROFILE_SCHEMA = {
+    "name": "memos_profile",
+    "description": (
+        "Retrieve all stored memories about the user — preferences, facts, "
+        "and tool memories. Use at conversation start to understand the user."
+    ),
+    "parameters": {"type": "object", "properties": {}, "required": []},
+}
+
 SEARCH_SCHEMA = {
     "name": "memos_search",
     "description": "Search memories by meaning via MemOS Cloud.",
@@ -74,6 +83,21 @@ SEARCH_SCHEMA = {
             "limit": {"type": "integer", "description": "Max results (default: 5)."},
         },
         "required": ["query"],
+    },
+}
+
+CONCLUDE_SCHEMA = {
+    "name": "memos_conclude",
+    "description": (
+        "Store a durable fact or preference about the user manually. "
+        "Stored verbatim (no LLM extraction)."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "conclusion": {"type": "string", "description": "The fact to store."},
+        },
+        "required": ["conclusion"],
     },
 }
 
@@ -184,8 +208,51 @@ class MemosMemoryProvider(MemoryProvider):
             return data
         return data
 
+    def _format_context_block(self, data: dict, max_item_chars: int = 1000) -> str:
+        """Format the memory payload similar to the OpenClaw plugin's formatContextBlock."""
+        if not data or not isinstance(data, dict):
+            return ""
+
+        memory_list = data.get("memory_detail_list", [])
+        pref_list = data.get("preference_detail_list", [])
+        tool_list = data.get("tool_memory_detail_list", [])
+        preference_note = data.get("preference_note")
+
+        lines = []
+        if memory_list:
+            lines.append("Facts:")
+            for item in memory_list:
+                text = item.get("memory_value") or item.get("memory_key") or ""
+                if text:
+                    lines.append(f"- {text[:max_item_chars]}")
+
+        if pref_list:
+            lines.append("Preferences:")
+            for item in pref_list:
+                pref = item.get("preference") or ""
+                type_str = f"({item['preference_type']}) " if item.get("preference_type") else ""
+                if pref:
+                    lines.append(f"- {type_str}{pref[:max_item_chars]}")
+
+        if tool_list:
+            lines.append("Tool Memories:")
+            for item in tool_list:
+                value = item.get("tool_value") or ""
+                if value:
+                    lines.append(f"- {value[:max_item_chars]}")
+
+        if preference_note:
+            lines.append(f"Preference Note: {preference_note[:max_item_chars]}")
+
+        return "\n".join(lines) if lines else ""
+
     def system_prompt_block(self) -> str:
-        return f"# MemOS Memory\nActive. User: {self._user_id}."
+        return (
+            "# MemOS Memory\n"
+            f"Active. User: {self._user_id}.\n"
+            "Use memos_search to find memories, memos_conclude to store facts, "
+            "memos_profile for a full overview."
+        )
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         if self._prefetch_thread and self._prefetch_thread.is_alive():
@@ -214,20 +281,11 @@ class MemosMemoryProvider(MemoryProvider):
                     payload["conversation_id"] = session_id
                     
                 results = self._call_api("/search/memory", payload)
-                if results and isinstance(results, list):
-                    # Guessing format based on typical memory APIs
-                    lines = []
-                    for r in results:
-                        if isinstance(r, dict):
-                            content = r.get("content") or r.get("text") or r.get("memory")
-                            if content:
-                                lines.append(content)
-                        elif isinstance(r, str):
-                            lines.append(r)
-                            
-                    if lines:
+                if results and isinstance(results, dict):
+                    formatted = self._format_context_block(results)
+                    if formatted:
                         with self._prefetch_lock:
-                            self._prefetch_result = "\\n".join(f"- {l}" for l in lines)
+                            self._prefetch_result = formatted
                 self._record_success()
             except Exception as e:
                 self._record_failure()
@@ -268,13 +326,37 @@ class MemosMemoryProvider(MemoryProvider):
         self._sync_thread.start()
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
-        return [SEARCH_SCHEMA]
+        return [PROFILE_SCHEMA, SEARCH_SCHEMA, CONCLUDE_SCHEMA]
 
     def handle_tool_call(self, tool_name: str, args: dict, **kwargs) -> str:
         if self._is_breaker_open():
             return json.dumps({"error": "MemOS API temporarily unavailable."})
 
-        if tool_name == "memos_search":
+        if tool_name == "memos_profile":
+            try:
+                payload = {
+                    "user_id": self._user_id,
+                    "query": "",
+                    "source": self._source,
+                    "agent_id": self._agent_id,
+                    "memory_limit_number": 20,
+                    "preference_limit_number": 10,
+                    "tool_memory_limit_number": 10,
+                    "include_preference": True,
+                    "include_tool_memory": True
+                }
+                results = self._call_api("/search/memory", payload)
+                self._record_success()
+                
+                formatted = self._format_context_block(results) if isinstance(results, dict) else ""
+                if not formatted:
+                    return json.dumps({"result": "No memories stored yet."})
+                return json.dumps({"result": formatted})
+            except Exception as e:
+                self._record_failure()
+                return tool_error(f"Failed to fetch profile: {e}")
+
+        elif tool_name == "memos_search":
             query = args.get("query", "")
             if not query:
                 return tool_error("Missing required parameter: query")
@@ -286,29 +368,40 @@ class MemosMemoryProvider(MemoryProvider):
                     "query": query,
                     "source": self._source,
                     "agent_id": self._agent_id,
-                    "memory_limit_number": limit
+                    "memory_limit_number": limit,
+                    "preference_limit_number": limit,
+                    "tool_memory_limit_number": limit,
+                    "include_preference": True,
+                    "include_tool_memory": True
                 }
                 results = self._call_api("/search/memory", payload)
                 self._record_success()
                 
-                if not results:
+                formatted = self._format_context_block(results) if isinstance(results, dict) else ""
+                if not formatted:
                     return json.dumps({"result": "No relevant memories found."})
-                
-                items = []
-                if isinstance(results, list):
-                    for r in results:
-                        if isinstance(r, dict):
-                            content = r.get("content") or r.get("text") or r.get("memory") or str(r)
-                            items.append({"memory": content})
-                        else:
-                            items.append({"memory": str(r)})
-                else:
-                    items.append({"memory": str(results)})
-                    
-                return json.dumps({"results": items, "count": len(items)})
+                return json.dumps({"result": formatted})
             except Exception as e:
                 self._record_failure()
                 return tool_error(f"Search failed: {e}")
+
+        elif tool_name == "memos_conclude":
+            conclusion = args.get("conclusion", "")
+            if not conclusion:
+                return tool_error("Missing required parameter: conclusion")
+            try:
+                payload = {
+                    "user_id": self._user_id,
+                    "messages": [{"role": "user", "content": conclusion}],
+                    "source": self._source,
+                    "agent_id": self._agent_id
+                }
+                self._call_api("/add/message", payload)
+                self._record_success()
+                return json.dumps({"result": "Fact stored."})
+            except Exception as e:
+                self._record_failure()
+                return tool_error(f"Failed to store: {e}")
 
         return tool_error(f"Unknown tool: {tool_name}")
 
